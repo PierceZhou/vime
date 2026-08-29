@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 def _begin_vllm_weight_update_session(rollout_engines: Sequence[ActorHandle]) -> None:
     if dist.get_rank() == 0:
         logger.info("vLLM weight update: start_weight_update")
-        ray.get([engine.start_weight_update.remote(is_checkpoint_format=True) for engine in rollout_engines])
+        ray.get([engine.start_weight_update.remote() for engine in rollout_engines])
     dist.barrier(group=get_gloo_group())
 
 
@@ -66,6 +66,7 @@ class UpdateWeightFromDistributed:
         self.model_name = model_name
         self.quantization_config = quantization_config
         self.weight_version = 0
+        self.update_weight_metrics: dict[str, float] = {}
         self._model_update_groups = None
         self._hf_weight_iterator = (
             HfWeightIteratorBase.create(
@@ -77,6 +78,11 @@ class UpdateWeightFromDistributed:
             if args.megatron_to_hf_mode == "bridge"
             else None
         )
+
+    def pop_metrics(self) -> dict[str, float]:
+        """Return and clear metrics for the most recent weight update."""
+        out, self.update_weight_metrics = self.update_weight_metrics, {}
+        return out
 
     def connect_rollout_engines(
         self,
@@ -128,7 +134,14 @@ class UpdateWeightFromDistributed:
         Pause → flush → _send_weights → continue. Progress on PP source.
         """
         self.weight_version += 1
+        self.update_weight_metrics = {}
+        self._perf_export_seconds = 0.0
+        self._perf_transfer_load_seconds = 0.0
+        self._perf_transferred_bytes = 0
+        self._perf_chunk_count = 0
+        total_started = time.perf_counter()
 
+        pause_started = time.perf_counter()
         if dist.get_rank() == 0:
             ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
@@ -141,17 +154,25 @@ class UpdateWeightFromDistributed:
                     rollout_engines=self.rollout_engines,
                 )
         dist.barrier(group=get_gloo_group())
+        pause_flush_seconds = time.perf_counter() - pause_started
 
         pbar = tqdm(desc=f"[{self._group_name}] Update weights", total=0) if self._is_pp_src_rank else None
+        prepare_started = time.perf_counter()
         _begin_vllm_weight_update_session(self.rollout_engines)
+        prepare_seconds = time.perf_counter() - prepare_started
+        transfer_phase_started = time.perf_counter()
         try:
             self._send_weights(pbar)
             if self._is_pp_src_rank:
                 torch.cuda.synchronize()
         finally:
+            transfer_phase_seconds = time.perf_counter() - transfer_phase_started
+            finish_started = time.perf_counter()
             _end_vllm_weight_update_session(self.rollout_engines)
+            finish_seconds = time.perf_counter() - finish_started
 
         dist.barrier(group=get_gloo_group())
+        resume_started = time.perf_counter()
         if dist.get_rank() == 0:
             # int4/fp4 post_process
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
@@ -162,6 +183,25 @@ class UpdateWeightFromDistributed:
                 )
             ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
+        resume_seconds = time.perf_counter() - resume_started
+
+        self.update_weight_metrics = {
+            "weight_update_total_seconds": time.perf_counter() - total_started,
+            "weight_update_pause_flush_seconds": pause_flush_seconds,
+            "weight_update_prepare_seconds": prepare_seconds,
+            "weight_update_transfer_phase_seconds": transfer_phase_seconds,
+            "weight_update_export_seconds": self._perf_export_seconds,
+            "weight_update_transfer_load_seconds": self._perf_transfer_load_seconds,
+            "weight_update_finish_seconds": finish_seconds,
+            "weight_update_resume_seconds": resume_seconds,
+            "weight_update_bytes": float(self._perf_transferred_bytes),
+            "weight_update_chunks": float(self._perf_chunk_count),
+            "weight_update_effective_gib_per_second": (
+                self._perf_transferred_bytes / (1024**3) / self._perf_transfer_load_seconds
+                if self._perf_transfer_load_seconds > 0
+                else 0.0
+            ),
+        }
 
     def _send_weights(self, pbar: tqdm | None) -> None:
         """
@@ -194,7 +234,14 @@ class UpdateWeightFromDistributed:
             logger.info("Using Megatron-Bridge HF weight export for non-colocate vLLM weight sync")
 
         megatron_local_weights = self.weights_getter()
-        for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
+        iterator = iter(self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights))
+        while True:
+            export_started = time.perf_counter()
+            try:
+                hf_named_tensors = next(iterator)
+            except StopIteration:
+                break
+            self._perf_export_seconds += time.perf_counter() - export_started
             if self._is_pp_src_rank:
                 hf_named_tensors = list(hf_named_tensors)
                 self._update_bucket_weights_from_distributed(hf_named_tensors, pbar=pbar, packed=use_vllm_packed)
@@ -316,6 +363,9 @@ class UpdateWeightFromDistributed:
         """
         Lock → broadcast → clear → unlock → pbar++. Lock prevents NCCL deadlock.
         """
+        chunk_bytes = sum(tensor.numel() * tensor.element_size() for _, tensor in converted_named_tensors)
+        transfer_started = time.perf_counter()
+
         # lock the rollout engines to prevent dead lock on broadcast.
         while not ray.get(self.rollout_engine_lock.acquire.remote()):
             time.sleep(0.1)
@@ -333,6 +383,9 @@ class UpdateWeightFromDistributed:
         converted_named_tensors.clear()
         ray.get(self.rollout_engine_lock.release.remote())
         pbar.update(1)
+        self._perf_transfer_load_seconds += time.perf_counter() - transfer_started
+        self._perf_transferred_bytes += chunk_bytes
+        self._perf_chunk_count += 1
 
 
 def connect_rollout_engines_from_distributed(

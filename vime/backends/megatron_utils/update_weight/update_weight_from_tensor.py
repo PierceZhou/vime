@@ -4,7 +4,9 @@ Colocated vLLM weight sync using native IPC transfer engines.
 
 from __future__ import annotations
 
+import logging
 import os
+import time
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict
@@ -25,6 +27,9 @@ from .update_weight_from_distributed import (
     post_process_weights,
     update_weights_from_distributed,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class UpdateWeightFromTensor:
@@ -131,10 +136,7 @@ class UpdateWeightFromTensor:
             self._ipc_initialized = True
 
     def pop_metrics(self) -> dict[str, float]:
-        """
-        Return and clear ``update_weight_metrics``. Empty under colocate today;
-        kept symmetric with UpdateWeightFromDistributed so the actor can drain unconditionally.
-        """
+        """Return and clear the most recent weight-update performance metrics."""
         out, self.update_weight_metrics = self.update_weight_metrics, {}
         return out
 
@@ -148,8 +150,11 @@ class UpdateWeightFromTensor:
         version++, flush caches, process buckets. Progress on rank 0.
         """
         self.weight_version += 1
+        self.update_weight_metrics = {}
+        total_started = time.perf_counter()
 
         rank = dist.get_rank()
+        pause_started = time.perf_counter()
         if rank == 0:
             ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
@@ -160,15 +165,32 @@ class UpdateWeightFromTensor:
                     rollout_engines=self.rollout_engines,
                 )
         dist.barrier(group=get_gloo_group())
+        pause_flush_seconds = time.perf_counter() - pause_started
 
         # Enter the native vLLM weight-update state machine on every colocated engine.
+        prepare_started = time.perf_counter()
         if rank == 0:
-            ray.get([engine.start_weight_update.remote(is_checkpoint_format=True) for engine in self.rollout_engines])
+            ray.get([engine.start_weight_update.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
+        prepare_seconds = time.perf_counter() - prepare_started
 
         megatron_local_weights = self.weights_getter()
+        iterator = iter(self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights))
+        export_seconds = 0.0
+        transfer_load_seconds = 0.0
+        transferred_bytes = 0
+        chunk_count = 0
+        while True:
+            export_started = time.perf_counter()
+            try:
+                hf_named_tensors = next(iterator)
+            except StopIteration:
+                break
+            export_seconds += time.perf_counter() - export_started
+            transferred_bytes += sum(tensor.numel() * tensor.element_size() for _, tensor in hf_named_tensors)
+            chunk_count += 1
 
-        for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
+            transfer_started = time.perf_counter()
             refs = self._send_hf_params(hf_named_tensors)
             ray.get(refs)
             # Free chunk tensors so the caching allocator can reuse the blocks.
@@ -177,6 +199,7 @@ class UpdateWeightFromTensor:
                 torch.npu.synchronize()
             else:
                 torch.cuda.ipc_collect()
+            transfer_load_seconds += time.perf_counter() - transfer_started
 
         dist.barrier(group=get_gloo_group())
         # After the barrier all engines have returned, so every rank's last-chunk
@@ -187,11 +210,14 @@ class UpdateWeightFromTensor:
             torch.cuda.ipc_collect()
 
         # Exit the native vLLM weight-update state machine.
+        finish_started = time.perf_counter()
         if rank == 0:
             ray.get([engine.finish_weight_update.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
+        finish_seconds = time.perf_counter() - finish_started
 
         # int4/fp4 post_process
+        resume_started = time.perf_counter()
         if rank == 0:
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
                 post_process_weights(
@@ -201,6 +227,22 @@ class UpdateWeightFromTensor:
                 )
             ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
+        resume_seconds = time.perf_counter() - resume_started
+
+        self.update_weight_metrics = {
+            "weight_update_total_seconds": time.perf_counter() - total_started,
+            "weight_update_pause_flush_seconds": pause_flush_seconds,
+            "weight_update_prepare_seconds": prepare_seconds,
+            "weight_update_export_seconds": export_seconds,
+            "weight_update_transfer_load_seconds": transfer_load_seconds,
+            "weight_update_finish_seconds": finish_seconds,
+            "weight_update_resume_seconds": resume_seconds,
+            "weight_update_bytes": float(transferred_bytes),
+            "weight_update_chunks": float(chunk_count),
+            "weight_update_effective_gib_per_second": (
+                transferred_bytes / (1024**3) / transfer_load_seconds if transfer_load_seconds > 0 else 0.0
+            ),
+        }
 
     def _send_hf_params(self, hf_named_tensors) -> list[object]:
         all_refs: list[object] = []
@@ -265,9 +307,8 @@ class _VLLMHijack:
     """vLLM worker extension helpers.
 
     On NPU:
-    - Patches NPUWorker.load_model and NPUWorker.start_weight_update to fix
-      MoE weight_loader missing on EP (a vLLM bug where w13_weight/w2_weight
-      params lack weight_loader attr when EP is enabled).
+    - Patches NPUWorker load/start/finish hooks to fix MoE weight_loader and
+      verify that online MXFP8 reload preserves graph-captured tensor storage.
     - Patches ApplyRotaryEmb.__init__ to skip flash_attn import
       (mindspeed/megatron backends introduce flash_attn as a dummy module,
       but vllm_ascend does not use it).
@@ -284,54 +325,17 @@ class _VLLMHijack:
         NPUWorker._npu_worker_patched = True
 
     @staticmethod
-    def _patch_a3_moe_alltoall_expert_ids() -> None:
-        """Restore the ALLTOALL expert-ID template after colocated memory reuse."""
-        from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
-
-        if get_ascend_device_type() != AscendDeviceType.A3:
-            return
-
-        from vllm_ascend.ops.fused_moe.token_dispatcher import TokenDispatcherWithAll2AllV
-
-        if getattr(TokenDispatcherWithAll2AllV, "_vime_expert_ids_patched", False):
-            return
-
-        original_dispatch_preprocess = TokenDispatcherWithAll2AllV._dispatch_preprocess
-        TokenDispatcherWithAll2AllV._vime_expert_ids_generation = 0
-
-        def _patched_dispatch_preprocess(self, hidden_states, topk_ids):
-            generation = TokenDispatcherWithAll2AllV._vime_expert_ids_generation
-            if self.num_local_experts > 1 and getattr(self, "_vime_seen_expert_ids_generation", -1) != generation:
-                expert_ids = self.expert_ids_per_ep_rank
-                self.expert_ids_per_ep_rank = torch.arange(
-                    self.num_experts,
-                    device=expert_ids.device,
-                    dtype=expert_ids.dtype,
-                ).remainder(self.num_local_experts)
-                self._vime_seen_expert_ids_generation = generation
-            return original_dispatch_preprocess(self, hidden_states, topk_ids)
-
-        TokenDispatcherWithAll2AllV._dispatch_preprocess = _patched_dispatch_preprocess
-        TokenDispatcherWithAll2AllV._vime_expert_ids_patched = True
-
-    @staticmethod
-    def _invalidate_moe_alltoall_expert_ids() -> None:
-        try:
-            from vllm_ascend.ops.fused_moe.token_dispatcher import TokenDispatcherWithAll2AllV
-        except ImportError:
-            return
-
-        if getattr(TokenDispatcherWithAll2AllV, "_vime_expert_ids_patched", False):
-            TokenDispatcherWithAll2AllV._vime_expert_ids_generation += 1
-
-    @staticmethod
     def _patch_one_worker(worker_cls: type) -> None:
         import inspect
 
         _orig_load_model = worker_cls.load_model
         _orig_start_weight_update = worker_cls.start_weight_update
+        _orig_finish_weight_update = worker_cls.finish_weight_update
         _orig_wake_up = worker_cls.wake_up
         has_dummy_kw = "load_dummy_weights" in inspect.signature(_orig_load_model).parameters
+        has_checkpoint_format_kw = (
+            "is_checkpoint_format" in inspect.signature(_orig_start_weight_update).parameters
+        )
 
         if has_dummy_kw:
 
@@ -346,17 +350,50 @@ class _VLLMHijack:
                 _VLLMHijack.patch_moe_weight_loader(self.model_runner.model)
 
         def _patched_start_weight_update(
-            self, is_checkpoint_format: bool = True, _orig=_orig_start_weight_update
+            self,
+            is_checkpoint_format: bool = True,
+            _orig=_orig_start_weight_update,
         ) -> None:
             _VLLMHijack.patch_moe_weight_loader(self.model_runner.model)
-            _orig(self, is_checkpoint_format=is_checkpoint_format)
-            _VLLMHijack._invalidate_moe_alltoall_expert_ids()
+            # Snapshot graph-visible MXFP8 tensors before native layerwise reload.
+            self._vime_mxfp8_kernel_snapshot = _VLLMHijack.snapshot_online_mxfp8_kernel_tensors(
+                self.model_runner.model
+            )
+            if has_checkpoint_format_kw:
+                _orig(self, is_checkpoint_format=is_checkpoint_format)
+            else:
+                if not is_checkpoint_format:
+                    raise RuntimeError(
+                        "This vLLM worker does not support direct-format weight updates."
+                    )
+                _orig(self)
+
+        def _patched_finish_weight_update(self, _orig=_orig_finish_weight_update) -> None:
+            _orig(self)
+            before = getattr(self, '_vime_mxfp8_kernel_snapshot', {})
+            if not before:
+                return
+            after = _VLLMHijack.snapshot_online_mxfp8_kernel_tensors(self.model_runner.model)
+            mismatches = _VLLMHijack.compare_kernel_tensor_snapshots(before, after)
+            self._vime_mxfp8_kernel_snapshot = {}
+            if mismatches:
+                details = ', '.join(mismatches[:8])
+                raise RuntimeError(
+                    'Online MXFP8 reload changed graph-visible kernel storage: '
+                    + details
+                    + '. Generation remains paused; use --vllm-enforce-eager '
+                    + 'or install a vLLM version with graph-safe layerwise reload.'
+                )
+            logger.info(
+                '[VIME_MXFP8_ADDRESS_GUARD] generation=%s verified=%d',
+                getattr(self, '_weight_update_generation', 'unknown'),
+                len(after),
+            )
 
         def _patched_wake_up(self, tags=None, _orig=_orig_wake_up) -> None:
             quant_config = self.vllm_config.quant_config
             if quant_config is not None:
                 _orig(self, tags=tags)
-                _VLLMHijack._invalidate_moe_alltoall_expert_ids()
                 return
 
             # vllm-ascend transposes unquantized w13_weight/w2_weight in
@@ -367,11 +404,52 @@ class _VLLMHijack:
                 _orig(self, tags=tags)
             finally:
                 self.vllm_config.quant_config = quant_config
-            _VLLMHijack._invalidate_moe_alltoall_expert_ids()
 
         worker_cls.load_model = _patched_load_model  # type: ignore[attr-defined]
         worker_cls.start_weight_update = _patched_start_weight_update  # type: ignore[attr-defined]
+        worker_cls.finish_weight_update = _patched_finish_weight_update  # type: ignore[attr-defined]
         worker_cls.wake_up = _patched_wake_up  # type: ignore[attr-defined]
+
+    @staticmethod
+    def snapshot_online_mxfp8_kernel_tensors(model: torch.nn.Module) -> dict[str, tuple]:
+        """Snapshot graph-visible online MXFP8 tensors outside the hot path."""
+        snapshot = {}
+        tensor_names = (
+            'weight',
+            'weight_scale',
+            'w13_weight',
+            'w13_weight_scale',
+            'w2_weight',
+            'w2_weight_scale',
+        )
+        for module_name, module in model.named_modules():
+            adapter = getattr(module, 'quant_method', None)
+            scheme = getattr(adapter, 'quant_method', adapter)
+            if not getattr(scheme, 'online_quantization', False):
+                continue
+            for tensor_name in tensor_names:
+                tensor = getattr(module, tensor_name, None)
+                if not isinstance(tensor, torch.Tensor) or tensor.device.type == 'meta':
+                    continue
+                qualified_name = f'{module_name}.{tensor_name}' if module_name else tensor_name
+                snapshot[qualified_name] = (
+                    id(tensor), tensor.data_ptr(), tuple(tensor.shape),
+                    tuple(tensor.stride()), tensor.dtype,
+                )
+        return snapshot
+
+    @staticmethod
+    def compare_kernel_tensor_snapshots(before: Mapping[str, tuple], after: Mapping[str, tuple]) -> list[str]:
+        """Return readable differences between kernel tensor snapshots."""
+        differences = []
+        for name in sorted(set(before) | set(after)):
+            if name not in before:
+                differences.append(f'{name}: added')
+            elif name not in after:
+                differences.append(f'{name}: removed')
+            elif before[name] != after[name]:
+                differences.append(f'{name}: storage/layout changed')
+        return differences
 
     @staticmethod
     def patch_moe_weight_loader(model: torch.nn.Module) -> None:
@@ -422,7 +500,6 @@ class vLLMColocateWorkerExtension:
 
     def __new__(cls, **kwargs):
         if is_npu():
-            _VLLMHijack._patch_a3_moe_alltoall_expert_ids()
             _VLLMHijack._patch_npu_worker()
             _VLLMHijack._patch_npu_rotary_emb()
         return super().__new__(cls)

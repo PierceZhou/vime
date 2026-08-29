@@ -445,12 +445,12 @@ def build_vllm_cmd_and_env(server_args: dict[str, Any]) -> tuple[list[str], dict
 
     # 3) weight_transfer_config: vllm default None disables /init_weight_transfer_engine,
     #    so vime's weight sync would fail.
-    #    - Colocated mode: use IPC backend. UpdateWeightFromTensor calls
-    #      IPCWeightTransferEngine.trainer_send_weights and passes an empty init_info
-    #      dict, which is the correct signature for the IPC backend.
-    #    - Non-colocated mode: use NCCL backend. Weight sync goes through
+    #    - Colocated mode: use npu_ipc on Ascend and ipc on CUDA.
+    #      UpdateWeightFromTensor owns the start/finish lifecycle and sends
+    #      checkpoint-format chunks through the backend compatibility sender.
+    #    - Non-colocated mode: use hccl on Ascend and nccl on CUDA. Weight sync goes through
     #      update_weights_from_distributed; the vLLM engine still needs
-    #      init_weight_transfer_engine to succeed (with NCCL the caller must supply
+    #      init_weight_transfer_engine to succeed (the collective backend caller supplies
     #      master_address, master_port, rank_offset, and world_size separately).
     #    Users who pass ``--vllm-weight-transfer-config`` explicitly are honored.
     if _user_overrode(args, "vllm_weight_transfer_config"):
@@ -459,9 +459,11 @@ def build_vllm_cmd_and_env(server_args: dict[str, Any]) -> tuple[list[str], dict
             _serialize_weight_transfer_config(args.vllm_weight_transfer_config),
         ]
     elif getattr(args, "colocate", False):
-        cmd += ["--weight-transfer-config", '{"backend":"ipc"}']
+        backend = "npu_ipc" if is_npu() else "ipc"
+        cmd += ["--weight-transfer-config", f'{{"backend":"{backend}"}}']
     else:
-        cmd += ["--weight-transfer-config", '{"backend":"nccl"}']
+        backend = "hccl" if is_npu() else "nccl"
+        cmd += ["--weight-transfer-config", f'{{"backend":"{backend}"}}']
 
     if "--worker-extension-cls" not in cmd:
         if getattr(args, "colocate", False):
@@ -875,9 +877,9 @@ class VLLMEngine(RayActor):
                     time.sleep(2 * attempt)
         raise RuntimeError(f"vLLM init_weight_transfer_engine failed: {last_error}") from last_error
 
-    def start_weight_update(self, is_checkpoint_format: bool = True) -> dict:
-        """``POST /start_weight_update`` — signals vLLM to enter IPC weight-update mode."""
-        return self._make_request("start_weight_update", {"is_checkpoint_format": is_checkpoint_format})
+    def start_weight_update(self) -> dict:
+        """``POST /start_weight_update`` using the vLLM 0.27 lifecycle API."""
+        return self._make_request("start_weight_update", {})
 
     def finish_weight_update(self) -> dict:
         """``POST /finish_weight_update`` — signals vLLM to exit IPC weight-update mode.
