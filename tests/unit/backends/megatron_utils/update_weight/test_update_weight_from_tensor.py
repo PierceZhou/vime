@@ -242,6 +242,29 @@ def test_colocated_lifecycle_uses_native_weight_transfer_session(upw_vllm):
     assert counters["barrier"] >= 4
 
 
+@pytest.mark.unit
+def test_update_weights_sends_lazy_chunk_after_counting_bytes(upw_vllm, monkeypatch):
+    obj = _make_instance(upw_vllm)
+    tensor = torch.zeros(2, 2)
+    sent = []
+    clock = [0.0]
+
+    def lazy_chunk():
+        clock[0] += 3.0
+        yield "layer.weight", tensor
+
+    obj._send_hf_params = lambda chunk: sent.append(list(chunk)) or []
+    monkeypatch.setattr(upw_vllm.time, "perf_counter", lambda: clock[0])
+    _run_update(obj, chunks=[lazy_chunk()])
+
+    assert len(sent) == 1
+    assert sent[0][0][0] == "layer.weight"
+    assert sent[0][0][1] is tensor
+    assert obj.update_weight_metrics["weight_update_bytes"] == tensor.numel() * tensor.element_size()
+    assert obj.update_weight_metrics["weight_update_chunks"] == 1
+    assert obj.update_weight_metrics["weight_update_export_seconds"] == 3.0
+
+
 @dataclass
 class _FakeUpdateInfo:
     names: list[str]

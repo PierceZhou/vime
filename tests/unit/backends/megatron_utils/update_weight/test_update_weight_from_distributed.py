@@ -500,6 +500,29 @@ def test_bridge_path_forwards_packed_flag_and_listifies_chunks(upw, monkeypatch)
 
 
 @pytest.mark.unit
+def test_bridge_export_time_includes_lazy_chunk_conversion(upw, monkeypatch):
+    obj = _make_instance(upw)
+    obj._perf_export_seconds = 0.0
+    obj._hf_weight_iterator = MagicMock()
+    clock = [0.0]
+
+    def lazy_chunk():
+        clock[0] += 3.0
+        yield "bridge.weight", torch.zeros(1)
+
+    obj._hf_weight_iterator.get_hf_weight_chunks.return_value = iter([lazy_chunk()])
+    sent = []
+    obj._update_bucket_weights_from_distributed = lambda chunk, **kwargs: sent.extend(chunk)
+    monkeypatch.setattr(upw.time, "perf_counter", lambda: clock[0])
+    monkeypatch.setattr(upw.dist, "barrier", lambda *args, **kwargs: None)
+
+    obj._sync_bridge_weights_to_rollout_engines(pbar=None, use_vllm_packed=True)
+
+    assert [name for name, _ in sent] == ["bridge.weight"]
+    assert obj._perf_export_seconds == 3.0
+
+
+@pytest.mark.unit
 def test_source_no_standalone_use_vllm_param(upw):
     src = inspect.getsource(upw)
     lines = [line.strip() for line in src.splitlines() if "use_vllm=" in line and "use_vllm_packed" not in line]
