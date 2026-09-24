@@ -334,9 +334,7 @@ class _VLLMHijack:
         _orig_finish_weight_update = worker_cls.finish_weight_update
         _orig_wake_up = worker_cls.wake_up
         has_dummy_kw = "load_dummy_weights" in inspect.signature(_orig_load_model).parameters
-        has_checkpoint_format_kw = (
-            "is_checkpoint_format" in inspect.signature(_orig_start_weight_update).parameters
-        )
+        has_checkpoint_format_kw = "is_checkpoint_format" in inspect.signature(_orig_start_weight_update).parameters
 
         if has_dummy_kw:
 
@@ -364,30 +362,28 @@ class _VLLMHijack:
                 _orig(self, is_checkpoint_format=is_checkpoint_format)
             else:
                 if not is_checkpoint_format:
-                    raise RuntimeError(
-                        "This vLLM worker does not support direct-format weight updates."
-                    )
+                    raise RuntimeError("This vLLM worker does not support direct-format weight updates.")
                 _orig(self)
 
         def _patched_finish_weight_update(self, _orig=_orig_finish_weight_update) -> None:
             _orig(self)
-            before = getattr(self, '_vime_mxfp8_kernel_snapshot', {})
+            before = getattr(self, "_vime_mxfp8_kernel_snapshot", {})
             if not before:
                 return
             after = _VLLMHijack.snapshot_online_mxfp8_kernel_tensors(self.model_runner.model)
             mismatches = _VLLMHijack.compare_kernel_tensor_snapshots(before, after)
             self._vime_mxfp8_kernel_snapshot = {}
             if mismatches:
-                details = ', '.join(mismatches[:8])
+                details = ", ".join(mismatches[:8])
                 raise RuntimeError(
-                    'Online MXFP8 reload changed graph-visible kernel storage: '
+                    "Online MXFP8 reload changed graph-visible kernel storage: "
                     + details
-                    + '. Generation remains paused; use --vllm-enforce-eager '
-                    + 'or install a vLLM version with graph-safe layerwise reload.'
+                    + ". Generation remains paused; use --vllm-enforce-eager "
+                    + "or install a vLLM version with graph-safe layerwise reload."
                 )
             logger.info(
-                '[VIME_MXFP8_ADDRESS_GUARD] generation=%s verified=%d',
-                getattr(self, '_weight_update_generation', 'unknown'),
+                "[VIME_MXFP8_ADDRESS_GUARD] generation=%s verified=%d",
+                getattr(self, "_weight_update_generation", "unknown"),
                 len(after),
             )
 
@@ -416,26 +412,29 @@ class _VLLMHijack:
         """Snapshot graph-visible online MXFP8 tensors outside the hot path."""
         snapshot = {}
         tensor_names = (
-            'weight',
-            'weight_scale',
-            'w13_weight',
-            'w13_weight_scale',
-            'w2_weight',
-            'w2_weight_scale',
+            "weight",
+            "weight_scale",
+            "w13_weight",
+            "w13_weight_scale",
+            "w2_weight",
+            "w2_weight_scale",
         )
         for module_name, module in model.named_modules():
-            adapter = getattr(module, 'quant_method', None)
-            scheme = getattr(adapter, 'quant_method', adapter)
-            if not getattr(scheme, 'online_quantization', False):
+            adapter = getattr(module, "quant_method", None)
+            scheme = getattr(adapter, "quant_method", adapter)
+            if not getattr(scheme, "online_quantization", False):
                 continue
             for tensor_name in tensor_names:
                 tensor = getattr(module, tensor_name, None)
-                if not isinstance(tensor, torch.Tensor) or tensor.device.type == 'meta':
+                if not isinstance(tensor, torch.Tensor) or tensor.device.type == "meta":
                     continue
-                qualified_name = f'{module_name}.{tensor_name}' if module_name else tensor_name
+                qualified_name = f"{module_name}.{tensor_name}" if module_name else tensor_name
                 snapshot[qualified_name] = (
-                    id(tensor), tensor.data_ptr(), tuple(tensor.shape),
-                    tuple(tensor.stride()), tensor.dtype,
+                    id(tensor),
+                    tensor.data_ptr(),
+                    tuple(tensor.shape),
+                    tuple(tensor.stride()),
+                    tensor.dtype,
                 )
         return snapshot
 
@@ -445,11 +444,11 @@ class _VLLMHijack:
         differences = []
         for name in sorted(set(before) | set(after)):
             if name not in before:
-                differences.append(f'{name}: added')
+                differences.append(f"{name}: added")
             elif name not in after:
-                differences.append(f'{name}: removed')
+                differences.append(f"{name}: removed")
             elif before[name] != after[name]:
-                differences.append(f'{name}: storage/layout changed')
+                differences.append(f"{name}: storage/layout changed")
         return differences
 
     @staticmethod
